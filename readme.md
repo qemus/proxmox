@@ -42,12 +42,6 @@ services:
 docker run -it --rm --name proxmox --hostname proxmox -p 8006:8006 --privileged --stop-timeout 60 docker.io/dockurr/proxmox
 ```
 
-##### Via Kubernetes:
-
-```shell
-kubectl apply -f https://raw.githubusercontent.com/dockur/proxmox/refs/heads/master/kubernetes.yml
-```
-
 ##### Via Github Codespaces:
 
 [![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/dockur/proxmox)
