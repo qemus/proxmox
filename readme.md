@@ -30,7 +30,6 @@ services:
     image: dockurr/proxmox
     container_name: proxmox
     environment:
-      USERNAME: "root"
       PASSWORD: "root"
     ports:
       - 8006:8006
@@ -42,7 +41,7 @@ services:
 ##### Via Docker CLI:
 
 ```bash
-docker run -it --rm --name proxmox --hostname pve -e "USERNAME=root" -e "PASSWORD=root" -p 8006:8006 --privileged --stop-timeout 60 docker.io/dockurr/proxmox
+docker run -it --rm --name proxmox --hostname pve -e "PASSWORD=root" -p 8006:8006 --privileged --stop-timeout 60 docker.io/dockurr/proxmox
 ```
 
 ##### Via Github Codespaces:
@@ -63,7 +62,7 @@ docker run -it --rm --name proxmox --hostname pve -e "USERNAME=root" -e "PASSWOR
   
   - Start the container and connect to [port 8006](http://127.0.0.1:8006/) using your web browser.
 
-  - Login using the credentials you specified in the `USERNAME` and `PASSWORD` environment variables.
+  - Login using the username `root` and the password you specified in the `PASSWORD` environment variable.
   
   Enjoy your time with your brand new Proxmox installation, and don't forget to star this repo!
 
