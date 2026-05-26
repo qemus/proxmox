@@ -115,6 +115,7 @@ COPY --chmod=755 ./entrypoint.sh /run/
 ENV PASSWORD="root"
 
 EXPOSE 8006
+STOPSIGNAL SIGRTMIN+3
 
 HEALTHCHECK --interval=60s --timeout=10s --start-period=60s --retries=3 \
   CMD curl -kLfSs http://localhost:8006 >/dev/null || exit 1
