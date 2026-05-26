@@ -121,6 +121,6 @@ echo "        bridge-stp off" >> "$file"
 echo "        bridge-fd 0" >> "$file"
 
 # Apply configuration
-cp "$file" /etc/network/interfaces
+cp "$file" /etc/network/interfaces.new
 
 exec /sbin/init 3
