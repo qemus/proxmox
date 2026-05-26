@@ -124,7 +124,9 @@ echo "        bridge-ports $NET_DEV" >> "$file"
 echo "        bridge-stp off" >> "$file"
 echo "        bridge-fd 0" >> "$file"
 
-cp "$file" /etc/network/interfaces
-cat /etc/network/interfaces
+# Apply configuration
+touch /etc/network/.pve-ignore.interfaces
+mv "$file" /etc/network/interfaces
+ifreload -a
 
 exec /sbin/init 3
