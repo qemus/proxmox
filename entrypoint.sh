@@ -2,8 +2,6 @@
 set -Eeuo pipefail
 
 # Docker environment variables
-
-: "${USERNAME:="root"}"
 : "${PASSWORD:="root"}"
 
 # Helper functions
@@ -62,9 +60,8 @@ if [ -n "$KVM_ERR" ]; then
   [[ "${DEBUG:-}" != [Yy1]* ]] && exit 19
 fi
 
-# Update username and password
-usermod -u 0 "$USERNAME" >/dev/null
-printf '%s:%s\n' "$USERNAME" "$PASSWORD" | chpasswd
+# Update password for root
+printf 'root:%s\n' "$PASSWORD" | chpasswd
 
 # Modify setting for LXC containers
 file="/lib/systemd/system/lxcfs.service"
