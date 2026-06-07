@@ -109,4 +109,18 @@ fi
 # Initialize network
 . network.sh
 
+# Ensure directory permissions
+dir="/var/lib/vz"
+mkdir -p "$dir"
+chown root:root "$dir" || :
+
+dir="/var/lib/pve-cluster"
+mkdir -p "$dir"
+chown root:root "$dir" || :
+
+dir="/var/log/pveproxy"
+mkdir -p "$dir"
+chown www-data:www-data "$dir" || :
+
+echo "Booting Proxmox VE..."
 exec "$@"
