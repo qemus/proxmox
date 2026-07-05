@@ -16,6 +16,51 @@ ADD_ERR="Please add the following setting to your container:"
 #  Functions
 # ######################################
 
+getMTU() {
+
+  local dev="$1"
+
+  if [ -r "/sys/class/net/$dev/mtu" ]; then
+    cat "/sys/class/net/$dev/mtu"
+  else
+    echo "0"
+  fi
+
+  return 0
+}
+
+minMTU() {
+
+  local mtu=""
+  local min=""
+
+  for mtu in "$@"; do
+    [[ -z "$mtu" || "$mtu" == "0" ]] && continue
+
+    if [[ -z "$min" || "$mtu" -lt "$min" ]]; then
+      min="$mtu"
+    fi
+  done
+
+  echo "${min:-0}"
+  return 0
+}
+
+setMTU() {
+
+  local dev="$1"
+  local mtu="$2"
+
+  # MTU 0 means "do not set"; MTU 1500 is the normal default and does not need setting.
+  [[ "$mtu" == "0" || "$mtu" == "1500" ]] && return 0
+
+  if ! ip link set dev "$dev" mtu "$mtu"; then
+    warn "failed to set MTU size of $dev to $mtu."
+  fi
+
+  return 0
+}
+
 configureDNS() {
 
   local fa="$1"
@@ -26,13 +71,24 @@ configureDNS() {
   local ip_last="${ip##*.}"
   local gw_last="${gateway##*.}"
   local file="/etc/dnsmasq.d/$fa.conf"
+  local mtu_option=""
+
+  if [[ "$LAN_MTU" != "0" && "$LAN_MTU" != "1500" ]]; then
+    mtu_option="dhcp-option=option:interface-mtu,$LAN_MTU"
+  fi
+
+  # Reserve both the bridge gateway address and the translated container address.
+  # The translated address is intentionally excluded from DHCP so it can be used
+  # later as a stable container/host identity inside the VM subnet.
 
   # Determine the sorted positions
   local low high
   if (( ip_last < gw_last )); then
-    low=$ip_last; high=$gw_last
+    low=$ip_last
+    high=$gw_last
   else
-    low=$gw_last; high=$ip_last
+    low=$gw_last
+    high=$ip_last
   fi
 
   # Build dhcp-range lines
@@ -56,6 +112,8 @@ configureDNS() {
     dhcp-option=option:netmask,$mask
     dhcp-option=option:router,$gateway
     dhcp-option=option:dns-server,$gateway
+    $mtu_option
+
     address=/host.lan/$gateway
 
     # DHCP settings
@@ -173,7 +231,7 @@ configureNAT() {
     fi
   fi
 
-  local ip base gateway
+  local ip base
   base=$(cut -d. -f3,4 <<< "$IP")
 
   if [[ "$IP" != "172.30."* ]]; then
@@ -182,20 +240,25 @@ configureNAT() {
     ip="172.31.$base"
   fi
 
-  if [[ "$ip" != *".1" ]]; then
-    gateway="${ip%.*}.1"
-  else
-    gateway="${ip%.*}.2"
+  local last="${ip##*.}"
+
+  if [[ ! "$last" =~ ^[0-9]+$ ]] || (( last < 2 || last > 254 )); then
+    ip="${ip%.*}.4"
   fi
 
+  local gateway="${ip%.*}.1"
   local subnet="${ip%.*}.0/24"
   local broadcast="${ip%.*}.255"
 
-  # Create a bridge with a static IP for the VM guests
-  { ip link add dev "$BRIDGE" type bridge ; rc=$?; } || :
+  # Create a bridge with a static IP for the VM LAN
+  { ip link add dev "$BRIDGE" type bridge; rc=$?; } || :
 
   if (( rc != 0 )); then
     error "failed to create bridge. $ADD_ERR --cap-add NET_ADMIN" && return 1
+  fi
+
+  if [[ "$LAN_MTU" != "0" ]]; then
+    setMTU "$BRIDGE" "$LAN_MTU"
   fi
 
   if ! ip address add "$gateway/24" broadcast "$broadcast" dev "$BRIDGE"; then
@@ -212,10 +275,8 @@ configureNAT() {
     error "$tuntap" && return 1
   fi
 
-  if [[ "$MTU" != "0" && "$MTU" != "1500" ]]; then
-    if ! ip link set dev "$TAP" mtu "$MTU"; then
-      warn "failed to set MTU size to $MTU."
-    fi
+  if [[ "$LAN_MTU" != "0" ]]; then
+    setMTU "$TAP" "$LAN_MTU"
   fi
 
   if ! ip link set dev "$TAP" address "$GATEWAY_MAC"; then
@@ -231,21 +292,58 @@ configureNAT() {
     error "failed to set master bridge!" && return 1
   fi
 
+  # Use the lowest effective VM-LAN MTU, without mutating the parent/uplink MTU.
+  if [[ "$LAN_MTU" != "0" ]]; then
+    LAN_MTU=$(minMTU "$LAN_MTU" "$(getMTU "$BRIDGE")" "$(getMTU "$TAP")")
+  fi
+
   # Flush existing tables
   clearTables
 
   # NAT traffic from bridge subnet to Docker uplink
-  if ! iptables -t nat -A POSTROUTING -o "$DEV" -s "$subnet" ! -d "$subnet" -m comment --comment "remove" -j MASQUERADE; then
+  if ! iptables -t nat -A POSTROUTING \
+    -o "$DEV" \
+    -s "$subnet" \
+    ! -d "$subnet" \
+    -m comment --comment "remove" \
+    -j MASQUERADE; then
     error "$tables" && return 1
   fi
 
-  # Allow forwarding from bridge -> dev
-  if ! iptables -A FORWARD -i "$BRIDGE" -o "$DEV" -m comment --comment "remove" -j ACCEPT; then
+  if (( KERNEL > 4 )); then
+    # Hack for guest VMs complaining about "bad udp checksums in 5 packets"
+    iptables -t mangle -A POSTROUTING \
+      -s "$subnet" \
+      -p udp \
+      --dport bootpc \
+      -m comment --comment "remove" \
+      -j CHECKSUM --checksum-fill > /dev/null 2>&1 || true
+  fi
+
+  # Clamp TCP MSS to avoid subtle MTU blackholes when the outer path has a smaller MTU.
+  iptables -t mangle -A FORWARD \
+    -s "$subnet" \
+    -p tcp \
+    --tcp-flags SYN,RST SYN \
+    -m comment --comment "remove" \
+    -j TCPMSS --clamp-mss-to-pmtu > /dev/null 2>&1 || true
+
+  # Allow outbound traffic from the Proxmox VM subnet to the Docker uplink.
+  if ! iptables -A FORWARD \
+    -s "$subnet" \
+    -o "$DEV" \
+    -m comment --comment "remove" \
+    -j ACCEPT; then
     error "failed to configure IP tables!" && return 1
   fi
 
-  # Allow return traffic
-  if ! iptables -A FORWARD -i "$DEV" -o "$BRIDGE" -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "remove" -j ACCEPT; then
+  # Allow return traffic from the Docker uplink back to the Proxmox VM subnet.
+  if ! iptables -A FORWARD \
+    -d "$subnet" \
+    -i "$DEV" \
+    -m conntrack --ctstate RELATED,ESTABLISHED \
+    -m comment --comment "remove" \
+    -j ACCEPT; then
     error "failed to configure IP tables!" && return 1
   fi
 
@@ -316,14 +414,23 @@ getInfo() {
     exit 29
   fi
 
-  local mac mtu=""
+  local mac mtu="" mtu_custom="N"
 
   if [ -f "/sys/class/net/$DEV/mtu" ]; then
     mtu=$(< "/sys/class/net/$DEV/mtu")
   fi
 
+  [ -n "$MTU" ] && mtu_custom="Y"
   [ -z "$MTU" ] && MTU="$mtu"
   [ -z "$MTU" ] && MTU="0"
+
+  LAN_MTU="$MTU"
+
+  # Automatically propagate smaller-than-standard MTUs, but do not automatically
+  # advertise jumbo frames unless the user explicitly requested MTU.
+  if [[ "$LAN_MTU" != "0" && "$LAN_MTU" -gt "1500" ]] && ! enabled "$mtu_custom"; then
+    LAN_MTU="1500"
+  fi
 
   # Generate MAC address based on Docker container ID in hostname
   HOST="$(hostname -s)"
