@@ -5,30 +5,26 @@ set -Eeuo pipefail
 
 : "${DEV:=""}"
 : "${MTU:=""}"
+: "${MAC:=""}"
 : "${TAP:="tap0"}"
 : "${NETWORK:="Y"}"
 : "${BRIDGE:="vmbr0"}"
 : "${MASK:="255.255.255.0"}"
+
+# Sanitize variables
+DEV=$(strip "$DEV")
+MTU=$(strip "$MTU")
+TAP=$(strip "$TAP")
+MAC=$(strip "$MAC")
+MASK=$(strip "$MASK")
+BRIDGE=$(strip "$BRIDGE")
+NETWORK=$(strip "$NETWORK")
 
 ADD_ERR="Please add the following setting to your container:"
 
 # ######################################
 #  Generic helpers
 # ######################################
-
-enabled() {
-  case "$(strip "${1:-}")" in
-    Y|y|YES|Yes|yes|TRUE|True|true|1|ON|On|on) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-disabled() {
-  case "$(strip "${1:-}")" in
-    N|n|NO|No|no|FALSE|False|false|0|OFF|Off|off) return 0 ;;
-    *) return 1 ;;
-  esac
-}
 
 isNAT() {
 
@@ -38,6 +34,38 @@ isNAT() {
     *)
       return 1 ;;
   esac
+}
+
+maskToCIDR() {
+
+  local mask="$1"
+  local prefix=""
+
+  prefix=$(ipcalc -p 0.0.0.0 "$mask" | awk -F= '/^PREFIX=/ { print $2 }')
+
+  if [[ ! "$prefix" =~ ^[0-9]+$ ]] || (( prefix < 1 || prefix > 30 )); then
+    error "Invalid MASK: '$mask'"
+    return 1
+  fi
+
+  echo "$prefix"
+  return 0
+}
+
+networkCIDR() {
+
+  local ip="$1"
+  local network=""
+
+  network=$(ipcalc -n "$ip" "$MASK" | awk -F= '/^NETWORK=/ { print $2 }')
+
+  if [ -z "$network" ]; then
+    error "Failed to calculate network address from IP '$ip' and netmask '$MASK'."
+    return 1
+  fi
+
+  echo "$network/$PREFIX"
+  return 0
 }
 
 getMTU() {
@@ -85,6 +113,83 @@ setMTU() {
   return 0
 }
 
+gatewayMAC() {
+
+  local mac="$1"
+
+  echo "$mac" | md5sum | sed 's/^\(..\)\(..\)\(..\)\(..\)\(..\).*$/02:\1:\2:\3:\4:\5/'
+}
+
+detectInterface() {
+
+  if [ -n "$DEV" ]; then
+    return 0
+  fi
+
+  # Give Kubernetes priority over the default interface
+  [ -d "/sys/class/net/net0" ] && DEV="net0"
+  [ -d "/sys/class/net/net1" ] && DEV="net1"
+  [ -d "/sys/class/net/net2" ] && DEV="net2"
+  [ -d "/sys/class/net/net3" ] && DEV="net3"
+
+  # Automatically detect the default network interface
+  [ -z "$DEV" ] && DEV=$(awk '$2 == 00000000 { print $1; exit }' /proc/net/route)
+  [ -z "$DEV" ] && DEV="eth0"
+
+  return 0
+}
+
+detectAddresses() {
+
+  GATEWAY=$(ip route list dev "$DEV" | awk ' /^default/ {print $3}' | head -n 1)
+  { UPLINK=$(ip address show dev "$DEV" | grep inet | awk '/inet / { print $2 }' | cut -f1 -d/ | head -n 1); } 2>/dev/null || :
+
+  IP6=""
+
+  if [ -f /proc/net/if_inet6 ] && [[ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null)" != "1" ]]; then
+    { IP6=$(ip -6 addr show dev "$DEV" scope global up); rc=$?; } 2>/dev/null || :
+    (( rc != 0 )) && IP6=""
+    [ -n "$IP6" ] && IP6=$(echo "$IP6" | sed -e's/^.*inet6 \([^ ]*\)\/.*$/\1/;t;d' | head -n 1)
+  fi
+
+  return 0
+}
+
+detectAdapter() {
+
+  local result=""
+
+  NIC=""
+  BUS=""
+
+  result=$(ethtool -i "$DEV" 2>/dev/null || :)
+
+  NIC=$(grep -m 1 -i 'driver:' <<< "$result" | awk '{print $2}')
+  BUS=$(grep -m 1 -i 'bus-info:' <<< "$result" | awk '{print $2}')
+
+  return 0
+}
+
+containerID() {
+
+  local id=""
+
+  id=$(hostname -s 2>/dev/null || true)
+
+  if [ -z "$id" ] && [ -s /etc/machine-id ]; then
+    id=$(< /etc/machine-id)
+  fi
+
+  if [ -z "$id" ] && [ -s /proc/sys/kernel/random/boot_id ]; then
+    id=$(< /proc/sys/kernel/random/boot_id)
+  fi
+
+  [ -z "$id" ] && id="unknown"
+
+  echo "$id"
+  return 0
+}
+
 disableIPv6() {
 
   local dev="$1"
@@ -98,6 +203,30 @@ disableIPv6() {
   return 0
 }
 
+subnetBase() {
+
+  local ip="$1"
+  local third=""
+  local second=""
+  local base=""
+  local subnet=""
+
+  third=$(cut -d. -f3 <<< "$ip")
+
+  for second in {30..254}; do
+    base="172.$second.$third"
+    subnet="$base.0/$PREFIX"
+
+    if ! ip route show "$subnet" 2>/dev/null | grep -q .; then
+      echo "$base"
+      return 0
+    fi
+  done
+
+  error "No available VM subnet found in 172.30.$third.0/$PREFIX through 172.254.$third.0/$PREFIX."
+  return 1
+}
+
 # ######################################
 #  DNS / interface helpers
 # ######################################
@@ -105,12 +234,9 @@ disableIPv6() {
 configureDNS() {
 
   local fa="$1"
-  local ip="$2"
-  local mask="$3"
-  local gateway="$4"
-  local base="${ip%.*}"
-  local ip_last="${ip##*.}"
-  local gw_last="${gateway##*.}"
+  local mask="$2"
+  local gateway="$3"
+  local base="${gateway%.*}"
   local file="/etc/dnsmasq.d/$fa.conf"
   local mtu_option=""
   local filter_dns=""
@@ -124,27 +250,6 @@ configureDNS() {
     filter_dns="filter-AAAA"
   fi
 
-  # Reserve both the bridge gateway address and the translated container address.
-  # The translated address is intentionally excluded from DHCP so it can be used
-  # later as a stable container/host identity inside the VM subnet.
-
-  # Determine the sorted positions
-  local low high
-  if (( ip_last < gw_last )); then
-    low=$ip_last
-    high=$gw_last
-  else
-    low=$gw_last
-    high=$ip_last
-  fi
-
-  # Build dhcp-range lines
-  local ranges=""
-  (( low > 1 )) && ranges+="dhcp-range=set:${fa},${base}.1,${base}.$((low - 1))"$'\n'
-  (( high - low > 1 )) && ranges+="dhcp-range=set:${fa},${base}.$((low + 1)),${base}.$((high - 1))"$'\n'
-  (( high < 254 )) && ranges+="dhcp-range=set:${fa},${base}.$((high + 1)),${base}.254"$'\n'
-  ranges="${ranges%$'\n'}"  # strip trailing newline
-
   if ! sed 's/^    //' > "$file" <<EOF
 
     # Listen only on bridge
@@ -152,8 +257,8 @@ configureDNS() {
     bind-interfaces
     except-interface=lo
 
-    # IPv4 DHCP ranges
-    $ranges
+    # IPv4 DHCP range
+    dhcp-range=set:${fa},${base}.2,${base}.254
 
     # Set gateway address
     dhcp-option=option:netmask,$mask
@@ -218,7 +323,7 @@ EOF
 
     auto $fa
     iface $fa inet static
-        address $gateway/24
+        address $gateway/$PREFIX
         bridge-ports $tap
         bridge-stp off
         bridge-fd 0
@@ -240,7 +345,6 @@ EOF
 createBridge() {
 
   local gateway="$1"
-  local broadcast="$2"
   local rc
 
   # Create a bridge with a static IP for the VM LAN
@@ -254,7 +358,7 @@ createBridge() {
     setMTU "$BRIDGE" "$LAN_MTU"
   fi
 
-  if ! ip address add "$gateway/24" broadcast "$broadcast" dev "$BRIDGE"; then
+  if ! ip address add "$gateway/$PREFIX" dev "$BRIDGE"; then
     error "failed to add IP address pool!" && return 1
   fi
 
@@ -320,16 +424,6 @@ configureTables() {
     error "$tables" && return 1
   fi
 
-  if (( KERNEL > 4 )); then
-    # Hack for guest VMs complaining about "bad udp checksums in 5 packets"
-    iptables -t mangle -A POSTROUTING \
-      -s "$subnet" \
-      -p udp \
-      --dport bootpc \
-      -m comment --comment "$rule_tag" \
-      -j CHECKSUM --checksum-fill > /dev/null 2>&1 || true
-  fi
-
   # Clamp TCP MSS to avoid subtle MTU blackholes when the outer path has a smaller MTU.
   iptables -t mangle -A FORWARD \
     -s "$subnet" \
@@ -386,26 +480,18 @@ configureNAT() {
     fi
   fi
 
-  local ip base
-  base=$(cut -d. -f3,4 <<< "$IP")
+  local base gateway subnet
 
-  if [[ "$IP" != "172.30."* ]]; then
-    ip="172.30.$base"
-  else
-    ip="172.31.$base"
+  base=$(subnetBase "$UPLINK") || return 1
+  gateway="$base.1"
+  subnet=$(networkCIDR "$gateway") || return 1
+
+  if ip route show "$subnet" 2>/dev/null | grep -q .; then
+    error "VM subnet $subnet conflicts with an existing route inside the container."
+    return 1
   fi
 
-  local last="${ip##*.}"
-
-  if [[ ! "$last" =~ ^[0-9]+$ ]] || (( last < 2 || last > 254 )); then
-    ip="${ip%.*}.4"
-  fi
-
-  local gateway="${ip%.*}.1"
-  local subnet="${ip%.*}.0/24"
-  local broadcast="${ip%.*}.255"
-
-  createBridge "$gateway" "$broadcast" || return 1
+  createBridge "$gateway" || return 1
   createTap "$tuntap" || return 1
 
   # Use the lowest effective VM-LAN MTU, without mutating the parent/uplink MTU.
@@ -416,7 +502,7 @@ configureNAT() {
   configureTables "$subnet" || return 1
 
   setInterfaces "$BRIDGE" "$TAP" "$gateway" || return 1
-  configureDNS "$BRIDGE" "$ip" "$MASK" "$gateway" || return 1
+  configureDNS "$BRIDGE" "$MASK" "$gateway" || return 1
 
   return 0
 }
@@ -426,6 +512,7 @@ configureNAT() {
 # ######################################
 
 clearTables() {
+
   local table="" line rules
   local rule_tag="remove"
   local re="--comment[[:space:]]+\"?$rule_tag\"?([[:space:]]|\$)"
@@ -478,49 +565,51 @@ closeBridge() {
 #  Detection
 # ######################################
 
-getInfo() {
-
-  if [ -z "$DEV" ]; then
-    # Give Kubernetes priority over the default interface
-    [ -d "/sys/class/net/net0" ] && DEV="net0"
-    [ -d "/sys/class/net/net1" ] && DEV="net1"
-    [ -d "/sys/class/net/net2" ] && DEV="net2"
-    [ -d "/sys/class/net/net3" ] && DEV="net3"
-    # Automatically detect the default network interface
-    [ -z "$DEV" ] && DEV=$(awk '$2 == 00000000 { print $1; exit }' /proc/net/route)
-    [ -z "$DEV" ] && DEV="eth0"
-  fi
+validateInterface() {
 
   if [ ! -d "/sys/class/net/$DEV" ]; then
     error "Network interface '$DEV' does not exist inside the container!"
-    error "$ADD_ERR -e \"DEV=NAME\" to specify another interface name." && exit 26
+    error "$ADD_ERR -e \"DEV=NAME\" to specify another interface name."
+    exit 26
   fi
 
-  GATEWAY=$(ip route list dev "$DEV" | awk ' /^default/ {print $3}' | head -n 1)
-  { IP=$(ip address show dev "$DEV" | grep inet | awk '/inet / { print $2 }' | cut -f1 -d/ | head -n 1); } 2>/dev/null || :
-  [ -z "$IP" ] && error "Could not determine container IPv4 address!" && exit 26
+  return 0
+}
 
-  IP6=""
-  # shellcheck disable=SC2143
-  if [ -f /proc/net/if_inet6 ] && [[ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null)" != "1" ]] && [ -n "$(ifconfig -a | grep inet6)" ]; then
-    { IP6=$(ip -6 addr show dev "$DEV" scope global up); rc=$?; } 2>/dev/null || :
-    (( rc != 0 )) && IP6=""
-    [ -n "$IP6" ] && IP6=$(echo "$IP6" | sed -e's/^.*inet6 \([^ ]*\)\/.*$/\1/;t;d' | head -n 1)
+validateMask() {
+
+  PREFIX=$(maskToCIDR "$MASK") || exit 28
+
+  if [[ "$PREFIX" != "24" ]]; then
+    error "MASK values other than 255.255.255.0 are not supported by this network layout."
+    exit 28
   fi
 
-  local nic="" bus="" result=""
-  result=$(ethtool -i "$DEV" 2>/dev/null || :)
+  return 0
+}
 
-  nic=$(grep -m 1 -i 'driver:' <<< "$result" | awk '{print $2}')
-  bus=$(grep -m 1 -i 'bus-info:' <<< "$result" | awk '{print $2}')
+validateAddresses() {
 
-  if [[ -n "$bus" && "${bus,,}" != "n/a" && "${bus,,}" != "tap" ]]; then
-    enabled "$DEBUG" && info "Detected NIC: ${nic:-unknown}  BUS: $bus"
+  [ -z "$UPLINK" ] && error "Could not determine container IPv4 address!" && exit 26
+
+  return 0
+}
+
+validateAdapter() {
+
+  if [[ -n "$BUS" && "${BUS,,}" != "n/a" && "${BUS,,}" != "tap" ]]; then
+    enabled "$DEBUG" && info "Detected NIC: ${NIC:-unknown}  BUS: $BUS"
     error "This container does not support host mode networking!"
     exit 29
   fi
 
-  local mac mtu="" mtu_custom="N"
+  return 0
+}
+
+configureMTU() {
+
+  local mtu=""
+  local mtu_custom="N"
 
   if [ -f "/sys/class/net/$DEV/mtu" ]; then
     mtu=$(< "/sys/class/net/$DEV/mtu")
@@ -538,21 +627,80 @@ getInfo() {
     LAN_MTU="1500"
   fi
 
-  # Generate MAC address based on Docker container ID in hostname
-  HOST="$(hostname -s)"
-  mac=$(echo "$HOST" | md5sum | sed 's/^\(..\)\(..\)\(..\)\(..\)\(..\).*$/02:\1:\2:\3:\4:\5/')
-  GATEWAY_MAC=$(echo "${mac^^}" | md5sum | sed 's/^\(..\)\(..\)\(..\)\(..\)\(..\).*$/02:\1:\2:\3:\4:\5/')
+  return 0
+}
 
-  if enabled "$DEBUG"; then
-    line="Host: $HOST  IP: $IP  Gateway: $GATEWAY  Interface: $DEV  MTU: $mtu"
-    [[ "$MTU" != "0" && "$MTU" != "$mtu" ]] && line+=" ($MTU)"
-    info "$line"
-    if [ -f /etc/resolv.conf ]; then
-      nameservers=$(grep '^nameserver ' /etc/resolv.conf | sed 's/^nameserver //' | paste -sd ',' | sed 's/,/, /g')
-      [ -n "$nameservers" ] && info "Nameservers: $nameservers"
-    fi
-    echo
+configureMAC() {
+
+  local container=""
+
+  container=$(containerID)
+
+  if [ -z "$MAC" ]; then
+    # Generate a MAC address based on a stable container identifier when possible.
+    MAC=$(echo "$container" | md5sum | sed 's/^\(..\)\(..\)\(..\)\(..\)\(..\).*$/02:\1:\2:\3:\4:\5/')
   fi
+
+  MAC="${MAC,,}"
+  MAC="${MAC//-/:}"
+
+  if [[ ${#MAC} == 12 ]]; then
+    local m="$MAC"
+    MAC="${m:0:2}:${m:2:2}:${m:4:2}:${m:6:2}:${m:8:2}:${m:10:2}"
+  fi
+
+  if [[ ${#MAC} != 17 ]]; then
+    error "Invalid MAC address: '$MAC', should be 12 or 17 digits long!"
+    exit 28
+  fi
+
+  # Keep the guest-facing gateway MAC stable across runs, otherwise Windows guests
+  # may detect a new network every boot.
+  GATEWAY_MAC=$(gatewayMAC "$MAC")
+
+  return 0
+}
+
+printNetworkDebug() {
+
+  local line=""
+  local host=""
+  local nameservers=""
+
+  enabled "$DEBUG" || return 0
+
+  host=$(hostname -s 2>/dev/null || true)
+  [ -z "$host" ] && host="unknown"
+
+  line="Host: $host  IP: $UPLINK  Gateway: $GATEWAY  Interface: $DEV  MAC: $MAC  MTU: $MTU  Mask: $MASK/$PREFIX"
+  info "$line"
+
+  if [ -f /etc/resolv.conf ]; then
+    nameservers=$(grep '^nameserver ' /etc/resolv.conf | sed 's/^nameserver //' | paste -sd ',' | sed 's/,/, /g')
+    [ -n "$nameservers" ] && info "Nameservers: $nameservers"
+  fi
+
+  echo
+  return 0
+}
+
+prepareNetwork() {
+
+  detectInterface
+  validateInterface
+
+  validateMask
+
+  detectAddresses
+  validateAddresses
+
+  detectAdapter
+  validateAdapter
+
+  configureMTU
+  configureMAC
+
+  printNetworkDebug
 
   return 0
 }
@@ -574,10 +722,15 @@ blockLicense
 
 disabled "$NETWORK" && return 0
 
+if ! isNAT; then
+  error "Unrecognized NETWORK value: \"$NETWORK\""
+  exit 48
+fi
+
 msg="Initializing network..."
 enabled "$DEBUG" && info "$msg"
 
-getInfo
+prepareNetwork
 closeBridge
 
 # Configure NAT networking
