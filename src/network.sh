@@ -518,6 +518,8 @@ configureNAT() {
   setInterfaces "$BRIDGE" "$TAP" "$gateway" || return 1
   configureDNS "$BRIDGE" "$MASK" "$gateway" || return 1
 
+  showBridgeInfo "$subnet" "$gateway"
+
   return 0
 }
 
@@ -697,10 +699,25 @@ showHostInfo() {
   local host=""
   local uplink=""
 
-  enabled "$DEBUG" || return 0
+  uplink=$(formatAddress "$UPLINK" "$PREFIX" || true)
+  [ -z "$uplink" ] && uplink="(none)"
+
+  local line="❯ Host: $uplink"
 
   host=$(containerID)
-  local line="Host: $host"
+  [ -n "$host" ] && line+=" ($host)"
+
+  local obvious=""
+  if [[ "$uplink" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)\.[0-9]+$ ]]; then
+    obvious="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}.1"
+  fi
+
+  local gateway="${GATEWAY:-}"
+  if [ -z "$gateway" ]; then
+    line+="  |  Gateway: (none)"
+  elif [[ "$gateway" != "$obvious" ]]; then
+    line+="  |  Gateway: $gateway"
+  fi
 
   local iface="$DEV"
   if [ -n "$NIC" ] && [[ "${NIC,,}" != "veth" ]]; then
@@ -708,39 +725,63 @@ showHostInfo() {
   fi
 
   [ -z "$iface" ] && iface="(none)"
-  line+="  Interface: $iface"
-
-  uplink=$(formatAddress "$UPLINK" "$PREFIX" || true)
-  [ -z "$uplink" ] && uplink="(none)"
-  line+="  IP: $uplink"
-
-  local gateway="${GATEWAY:-}"
-  [ -z "$gateway" ] && gateway="(none)"
-  line+="  Gateway: $gateway"
+  [[ "$iface" != "eth0" ]] && line+="  |  Interface: $iface"
 
   mtu=$(getMTU "$DEV")
   if [ -n "$mtu" ] && [[ "$mtu" != "0" && "$mtu" != "1500" ]]; then
-    line+="  MTU: $mtu"
+    line+="  |  MTU: $mtu"
   fi
 
-  local count="0"
-  local file="/etc/resolv.conf"
+  local nameservers=""
+  local file="/etc/resolv.dnsmasq"
+  [ ! -f "$file" ] && file="/etc/resolv.conf"
 
   if [ -f "$file" ]; then
-    count=$(grep -c '^nameserver ' "$file" || true)
     nameservers=$(grep '^nameserver ' "$file" | sed 's/^nameserver //' | paste -sd ',' | sed 's/,/, /g')
   fi
 
   [ -z "$nameservers" ] && nameservers="(none)"
+  [[ "$nameservers" == "127.0.0.1"* ]] && nameservers=""
 
-  if (( count <= 1 )); then
-    line+="  Nameserver: $nameservers"
-    info "$line"
-  else
-    info "$line"
-    info "Nameservers: $nameservers"
-  fi
+  echo
   
+  if (( ${#nameservers} <= 40 )); then
+    [ -n "$nameservers" ] && line+="  |  DNS: $nameservers"
+    echo "$line"
+  else
+    echo "$line"
+    echo "❯ DNS: $nameservers"
+  fi
+
+  return 0
+}
+
+showBridgeInfo() {
+
+  local subnet="$1"
+  local gateway="$2"
+  local mtu=""
+  local base=""
+  local dhcp=""
+  local display=""
+
+  display=$(formatAddress "$gateway" "$PREFIX" || true)
+
+  base="${gateway%.*}"
+  dhcp="$base.2-$base.254"
+
+  local line="❯ Bridge: $BRIDGE  |  Gateway: $display  |  DHCP: $dhcp"
+
+  if [[ "$PREFIX" != "24" ]]; then
+    line+="  |  Subnet: $subnet"
+  fi
+
+  mtu=$(getMTU "$BRIDGE")
+  if [ -n "$mtu" ] && [[ "$mtu" != "0" && "$mtu" != "1500" ]]; then
+    line+="  |  MTU: $mtu"
+  fi
+
+  echo "$line"
   echo
   return 0
 }
