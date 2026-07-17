@@ -11,8 +11,6 @@ set -Eeuo pipefail
 : "${BRIDGE:="vmbr0"}"
 : "${MASK:="255.255.255.0"}"
 
-: "${ENGINE:=""}"
-: "${ROOTLESS:="N"}"
 
 # Sanitize variables
 DEV=$(strip "$DEV")
@@ -142,37 +140,6 @@ networkCIDR() {
   return 0
 }
 
-detectEngine() {
-
-  if [ -f "/run/.containerenv" ]; then
-    ENGINE="${container:-}"
-
-    if [[ "${ENGINE,,}" == *"podman"* ]]; then
-      ENGINE="Podman"
-    else
-      [ -z "$ENGINE" ] && ENGINE="Kubernetes"
-    fi
-  elif [ -f "/.dockerenv" ]; then
-    ENGINE="Docker"
-  fi
-
-  return 0
-}
-
-detectRootless() {
-
-  local uid_map=""
-
-  uid_map=$(awk '{$1=$1; print}' /proc/self/uid_map 2>/dev/null || true)
-
-  if [[ "$uid_map" == "0 0 4294967295" ]]; then
-    ROOTLESS="N"
-  else
-    ROOTLESS="Y"
-  fi
-
-  return 0
-}
 
 detectInterface() {
 
@@ -180,7 +147,7 @@ detectInterface() {
     return 0
   fi
 
-  # Give Kubernetes priority over the default interface
+  # Prefer the last attached Kubernetes network
   [ -d "/sys/class/net/net0" ] && DEV="net0"
   [ -d "/sys/class/net/net1" ] && DEV="net1"
   [ -d "/sys/class/net/net2" ] && DEV="net2"
@@ -224,8 +191,19 @@ detectAdapter() {
 
   result=$(ethtool -i "$DEV" 2>/dev/null || :)
 
-  NIC=$(grep -m 1 -i 'driver:' <<< "$result" | awk '{ print $2 }')
-  BUS=$(grep -m 1 -i 'bus-info:' <<< "$result" | awk '{ print $2 }')
+  NIC=$(awk -F':[[:space:]]*' '
+    tolower($1) == "driver" {
+      print $2
+      exit
+    }
+  ' <<< "$result")
+
+  BUS=$(awk -F':[[:space:]]*' '
+    tolower($1) == "bus-info" {
+      print $2
+      exit
+    }
+  ' <<< "$result")
 
   return 0
 }
@@ -263,6 +241,30 @@ disableIPv6() {
   return 0
 }
 
+subnetInUse() {
+
+  local subnet="$1"
+  local broader="" narrower="" routes=""
+
+  if ! broader=$(ip -4 route show table all match "$subnet" 2>/dev/null); then
+    error "Failed to inspect existing routes for subnet $subnet."
+    return 2
+  fi
+
+  if ! narrower=$(ip -4 route show table all root "$subnet" 2>/dev/null); then
+    error "Failed to inspect existing routes for subnet $subnet."
+    return 2
+  fi
+
+  routes=$(
+    printf '%s\n%s\n' "$broader" "$narrower" |
+      grep -Ev '(^|[[:space:]])default([[:space:]]|$)' |
+      sort -u || true
+  )
+
+  [ -n "$routes" ]
+}
+
 subnetBase() {
 
   local ip="$1"
@@ -270,6 +272,7 @@ subnetBase() {
   local second=""
   local base=""
   local subnet=""
+  local rc=0
 
   third=$(cut -d. -f3 <<< "$ip")
 
@@ -277,10 +280,15 @@ subnetBase() {
     base="172.$second.$third"
     subnet="$base.0/$PREFIX"
 
-    if ! ip route show "$subnet" 2>/dev/null | grep -q .; then
-      echo "$base"
-      return 0
+    if subnetInUse "$subnet"; then
+      continue
+    else
+      rc=$?
+      (( rc == 1 )) || return 1
     fi
+
+    echo "$base"
+    return 0
   done
 
   error "No available VM subnet found in 172.30.$third.0/$PREFIX through 172.254.$third.0/$PREFIX."
@@ -310,7 +318,7 @@ configureDNS() {
     filter_dns="filter-AAAA"
   fi
 
-  if ! sed 's/^    //' > "$file" <<EOF
+  if ! sed 's/^    //' > "$file" <<EOF2
 
     # Listen only on bridge
     interface=$fa
@@ -335,7 +343,7 @@ configureDNS() {
     # Windows compatibility
     dhcp-option=252,"\n"
     dhcp-option=vendor:MSFT,2,1i
-EOF
+EOF2
   then
     error "Failed to write dnsmasq config file: $file"
     return 1
@@ -353,10 +361,10 @@ setInterfaces() {
   # Add all available network interfaces
   local file="/etc/network/interfaces.new"
 
-  if ! sed 's/^    //' > "$file" <<EOF
+  if ! sed 's/^    //' > "$file" <<EOF2
     auto lo
     iface lo inet loopback
-EOF
+EOF2
   then
     error "Failed to write network interface config file: $file"
     return 1
@@ -366,11 +374,11 @@ EOF
 
     [[ "${i,,}" == "${fa,,}" ]] && continue
 
-    if ! sed 's/^        //' >> "$file" <<EOF
+    if ! sed 's/^        //' >> "$file" <<EOF2
 
         auto $i
         iface $i inet manual
-EOF
+EOF2
     then
       error "Failed to append interface $i to config file: $file"
       return 1
@@ -379,7 +387,7 @@ EOF
   done < <(ip -o link show | awk -F': ' '{ print $2 }' | grep -v lo | sed 's/@.*//')
 
   # Configure bridge
-  if ! sed 's/^    //' >> "$file" <<EOF
+  if ! sed 's/^    //' >> "$file" <<EOF2
 
     auto $fa
     iface $fa inet static
@@ -389,7 +397,7 @@ EOF
         bridge-fd 0
 
     source /etc/network/interfaces.d/*
-EOF
+EOF2
   then
     error "Failed to append bridge config to file: $file"
     return 1
@@ -412,7 +420,14 @@ createBridge() {
 
   if (( rc != 0 )); then
     [ -n "$msg" ] && echo "$msg" >&2
-    error "failed to create bridge. $ADD_ERR --cap-add NET_ADMIN"
+
+    case "${msg,,}" in
+      *"operation not permitted"* | *"permission denied"* )
+        error "failed to create bridge. $ADD_ERR --cap-add NET_ADMIN" ;;
+      * )
+        error "failed to create bridge." ;;
+    esac
+
     return 1
   fi
 
@@ -474,15 +489,49 @@ createTap() {
   return 0
 }
 
+# ######################################
+#  IP tables
+# ######################################
+
+getTablesBackend() {
+
+  local version=""
+  version=$(iptables --version 2>/dev/null || true)
+
+  case "$version" in
+    *nf_tables* ) echo "nft" ;;
+    *legacy* ) echo "legacy" ;;
+    * ) return 1 ;;
+  esac
+}
+
+setTables() {
+
+  local mode="$1"
+  local path=""
+
+  path=$(command -v "iptables-$mode" 2>/dev/null || true)
+  [ -z "$path" ] && return 1
+
+  update-alternatives --set iptables "$path" > /dev/null 2>&1
+}
+
 showRules() {
 
   local table="$1"
   local chain="$2"
   local label="$3"
+  local rule_tag="$4"
   local rules=""
+  local own_rule="--comment[[:space:]]+\"?$rule_tag\"?([[:space:]]|\$)"
 
-  rules=$(iptables -t "$table" -S "$chain" 2>/dev/null |
-    awk '$1 == "-A"' || true)
+  enabled "$DEBUG" || return 0
+
+  rules=$(
+    iptables -t "$table" -S "$chain" 2>/dev/null |
+      awk '$1 == "-A"' |
+      grep -Ev -- "$own_rule" || true
+  )
 
   [ -n "$rules" ] || return 0
 
@@ -492,12 +541,15 @@ showRules() {
 
 checkExistingTables() {
 
-  local msg=""
-  local rules=""
-  local conflicts=""
+  local msg="" rules="" conflicts=""
+  local rule_tag="PROXMOX_NAT"
+  local own_rule="--comment[[:space:]]+\"?$rule_tag\"?([[:space:]]|\$)"
 
-  rules=$(iptables -t filter -S FORWARD 2>/dev/null |
-    awk '$1 == "-A"' || true)
+  rules=$(
+    iptables -t filter -S FORWARD 2>/dev/null |
+      awk '$1 == "-A"' |
+      grep -Ev -- "$own_rule" || true
+  )
 
   conflicts=$(grep -E -- \
     '^-A FORWARD .*(-j DROP|-j REJECT)( |$)' \
@@ -513,62 +565,285 @@ checkExistingTables() {
     fi
   fi
 
-  if enabled "$DEBUG"; then
-    showRules filter FORWARD "filter FORWARD"
-    showRules nat POSTROUTING "NAT POSTROUTING"
+  showRules filter FORWARD "filter FORWARD" "$rule_tag"
+  showRules nat POSTROUTING "NAT POSTROUTING" "$rule_tag"
+
+  return 0
+}
+
+runTableRule() {
+
+  local silent="$1"
+  local result="$2"
+  local rc msg=""
+
+  shift 2
+
+  printf -v "$result" '%s' ""
+
+  { msg=$("$@" 2>&1); rc=$?; } || :
+  (( rc == 0 )) && return 0
+
+  printf -v "$result" '%s' "$msg"
+
+  if ! enabled "$silent" || enabled "$DEBUG"; then
+    [ -n "$msg" ] && echo "$msg" >&2
   fi
 
+  return 1
+}
+
+tableError() {
+
+  local silent="$1"
+  local message="${2,,}"
+
+  if enabled "$silent" && ! enabled "$DEBUG"; then
+    return 1
+  fi
+
+  case "$message" in
+    *"permission denied"* | *"operation not permitted"* )
+      warn "IP tables access was denied. Add the NET_ADMIN capability."
+      ;;
+    *"table does not exist"* | *"can't initialize iptables table"* )
+      warn "The required IP tables kernel modules may be unavailable. Try: sudo modprobe ip_tables iptable_nat"
+      ;;
+    *"no chain/target/match by that name"* )
+      warn "A required IP tables target or match is unavailable in the host kernel."
+      ;;
+    *"could not fetch rule set generation id"* )
+      warn "The nftables backend is unavailable or inaccessible in this container."
+      ;;
+    * )
+      warn "Failed to configure IP tables. Verify NET_ADMIN access and host IP tables support."
+      ;;
+  esac
+
+  return 1
+}
+
+applyTables() {
+
+  local subnet="$1"
+  local silent="${2:-N}"
+  local table_error=""
+  local rule_tag="PROXMOX_NAT"
+
+  # NAT traffic from the VM subnet leaving through any external interface.
+  if ! runTableRule "$silent" table_error \
+    iptables -t nat -A POSTROUTING \
+    ! -o "$BRIDGE" \
+    -s "$subnet" \
+    ! -d "$subnet" \
+    -m comment --comment "$rule_tag" \
+    -j MASQUERADE; then
+    tableError "$silent" "$table_error"
+    return 1
+  fi
+
+  # Allow traffic from the VM bridge to any external interface.
+  if ! runTableRule "$silent" table_error \
+    iptables -A FORWARD \
+    -i "$BRIDGE" \
+    ! -o "$BRIDGE" \
+    -s "$subnet" \
+    -m comment --comment "$rule_tag" \
+    -j ACCEPT; then
+    tableError "$silent" "$table_error"
+    return 1
+  fi
+
+  # Allow traffic from any external interface to the VM subnet.
+  if ! runTableRule "$silent" table_error \
+    iptables -A FORWARD \
+    ! -i "$BRIDGE" \
+    -o "$BRIDGE" \
+    -d "$subnet" \
+    -m comment --comment "$rule_tag" \
+    -j ACCEPT; then
+    tableError "$silent" "$table_error"
+    return 1
+  fi
+
+  return 0
+}
+
+clearTables() {
+
+  local table="" line=""
+  local rules="" failed="N"
+  local rule_tag="PROXMOX_NAT"
+  local re="--comment[[:space:]]+\"?$rule_tag\"?([[:space:]]|\$)"
+
+  # Return 2 when the currently selected backend cannot be accessed.
+  # This lets configureTables() distinguish it from an actual rule-cleanup failure.
+  if ! rules=$(iptables-save 2> /dev/null); then
+    return 2
+  fi
+
+  if [ -n "$rules" ]; then
+
+    # Delete every rule tagged with our unique identifier,
+    # leaving all other rules intact.
+    while IFS= read -r line; do
+
+      case "$line" in
+        \*nat ) table="nat" ;;
+        \*filter ) table="filter" ;;
+        \*mangle ) table="mangle" ;;
+        \*raw ) table="raw" ;;
+      esac
+
+      if [[ "$line" == -A* ]] && [[ "$line" =~ $re ]]; then
+        line="${line/-A /-D }"
+
+        # Parse the quoting produced by iptables-save before deleting the rule.
+        if ! printf '%s\n' "$line" |
+          xargs -r iptables -t "$table" > /dev/null 2>&1; then
+          failed="Y"
+        fi
+      fi
+
+    done <<< "$rules"
+
+  fi
+
+  enabled "$failed" && return 1
   return 0
 }
 
 configureTables() {
 
   local subnet="$1"
-  local rule_tag="remove"
-  local tables_err="failed to configure IP tables!"
-  local tables="the 'ip_tables' kernel module is not loaded. Try this command: sudo modprobe ip_tables iptable_nat"
+  local preferred=""
+  local alternate="" rc=0
+  local preferred_clean="N"
+  local alternate_dirty="N"
 
+  preferred=$(getTablesBackend) || {
+    error "failed to determine the active IP tables backend!"
+    return 1
+  }
+
+  case "$preferred" in
+    "nft" ) alternate="legacy" ;;
+    "legacy" ) alternate="nft" ;;
+    * )
+      error "unsupported IP tables backend: $preferred"
+      return 1 ;;
+  esac
+
+  # Try the preferred backend first.
+  if clearTables; then
+
+    preferred_clean="Y"
+
+    # Try the preferred backend without reporting provisional failures.
+    if applyTables "$subnet" "Y"; then
+      checkExistingTables
+      return 0
+    fi
+
+    # Never switch backends while partial rules remain in the preferred backend.
+    if ! clearTables; then
+      error "failed to clean up the partial $preferred IP tables configuration!"
+      return 1
+    fi
+
+  else
+
+    rc=$?
+
+    # The preferred backend was accessible, but its rules could not be removed.
+    # Do not switch while partial or stale rules may still be active.
+    if (( rc == 1 )); then
+      error "failed to clean up the existing $preferred IP tables configuration!"
+      return 1
+    fi
+
+    # Return code 2 means the preferred backend itself could not be accessed,
+    # so it is safe to try the alternate backend.
+    if (( rc != 2 )); then
+      error "failed to access the $preferred IP tables backend!"
+      return 1
+    fi
+
+    enabled "$DEBUG" && warn "failed to access the $preferred IP tables backend!"
+
+  fi
+
+  # Try the alternate backend when the preferred backend failed.
+  if setTables "$alternate"; then
+
+    # Remove rules left by a previous run from the alternate backend.
+    if clearTables; then
+
+      if applyTables "$subnet" "Y"; then
+        checkExistingTables
+        return 0
+      fi
+
+      if ! clearTables; then
+        alternate_dirty="Y"
+        error "failed to clean up the partial $alternate IP tables configuration!"
+      fi
+
+    else
+
+      rc=$?
+
+      # Only mark the alternate backend dirty when it was accessible but cleanup failed.
+      if (( rc == 1 )); then
+        alternate_dirty="Y"
+        error "failed to clean up the existing $alternate IP tables configuration!"
+      elif (( rc != 2 )); then
+        alternate_dirty="Y"
+        error "failed to inspect the existing $alternate IP tables configuration!"
+      elif enabled "$DEBUG"; then
+        warn "failed to access the $alternate IP tables backend!"
+      fi
+
+    fi
+
+  fi
+
+  # Restore the preferred backend after the alternate attempt failed.
+  if ! setTables "$preferred"; then
+    error "failed to restore the preferred $preferred IP tables backend!"
+    return 1
+  fi
+
+  # Do not continue while partial rules remain in the alternate backend.
+  enabled "$alternate_dirty" && return 1
+
+  # Both backend failures were already shown in debug mode.
+  enabled "$DEBUG" && return 1
+
+  # An inaccessible preferred backend cannot be retried diagnostically.
+  if ! enabled "$preferred_clean"; then
+    error "failed to access both IP tables backends!"
+    return 1
+  fi
+
+  # Verify that no rules remain before the diagnostic attempt.
   if ! clearTables; then
-    error "failed to select a working IP tables backend!"
+    error "failed to clean up the existing $preferred IP tables configuration!"
     return 1
   fi
 
-  checkExistingTables
-
-  # NAT traffic from the VM subnet leaving through any external interface.
-  if ! iptables -t nat -A POSTROUTING \
-    ! -o "$BRIDGE" \
-    -s "$subnet" \
-    ! -d "$subnet" \
-    -m comment --comment "$rule_tag" \
-    -j MASQUERADE; then
-    error "$tables"
-    return 1
+  # Repeat the preferred backend once to show its actual failure.
+  if applyTables "$subnet" "N"; then
+    checkExistingTables
+    return 0
   fi
 
-  # Allow traffic from the VM bridge to any external interface.
-  if ! iptables -A FORWARD \
-    -i "$BRIDGE" \
-    ! -o "$BRIDGE" \
-    -s "$subnet" \
-    -m comment --comment "$rule_tag" \
-    -j ACCEPT; then
-    error "$tables_err"
-    return 1
+  # Do not leave a partial ruleset after the final failed attempt.
+  if ! clearTables; then
+    error "failed to clean up the partial $preferred IP tables configuration!"
   fi
 
-  # Allow traffic from any external interface to the VM subnet.
-  if ! iptables -A FORWARD \
-    ! -i "$BRIDGE" \
-    -o "$BRIDGE" \
-    -d "$subnet" \
-    -m comment --comment "$rule_tag" \
-    -j ACCEPT; then
-    error "$tables_err"
-    return 1
-  fi
-
-  return 0
+  return 1
 }
 
 configureNAT() {
@@ -607,9 +882,11 @@ configureNAT() {
   if [[ "$forwarding" != "1" ]]; then
     { sysctl -w net.ipv4.ip_forward=1 > /dev/null 2>&1; rc=$?; } || :
 
-    if (( rc != 0 )) ||
-      [[ ! -r /proc/sys/net/ipv4/ip_forward ]] ||
-      [[ $(< /proc/sys/net/ipv4/ip_forward) -eq 0 ]]; then
+    forwarding=""
+    [ -r /proc/sys/net/ipv4/ip_forward ] &&
+      forwarding=$(< /proc/sys/net/ipv4/ip_forward)
+
+    if (( rc != 0 )) || [[ "$forwarding" != "1" ]]; then
       error "IP forwarding is disabled. $ADD_ERR --sysctl net.ipv4.ip_forward=1"
       return 1
     fi
@@ -619,9 +896,12 @@ configureNAT() {
   gateway="$base.1"
   subnet=$(networkCIDR "$gateway") || return 1
 
-  if ip route show "$subnet" 2>/dev/null | grep -q .; then
+  if subnetInUse "$subnet"; then
     error "VM subnet $subnet conflicts with an existing route inside the container."
     return 1
+  else
+    rc=$?
+    (( rc == 1 )) || return 1
   fi
 
   createBridge "$gateway" || return 1
@@ -639,112 +919,6 @@ configureNAT() {
 
   showBridgeInfo "$subnet" "$gateway"
 
-  return 0
-}
-
-# ######################################
-#  IP tables
-# ######################################
-
-setTables() {
-
-  local mode="$1"
-  local path=""
-
-  path=$(command -v "iptables-$mode" 2>/dev/null || true)
-  [ -z "$path" ] && return 1
-
-  update-alternatives --set iptables "$path" > /dev/null 2>&1
-}
-
-testTables() {
-
-  local table=""
-
-  # Test every table required by the networking rules.
-  for table in nat filter; do
-    iptables -w -t "$table" -S > /dev/null 2>&1 || return 1
-    iptables-save -t "$table" > /dev/null 2>&1 || return 1
-  done
-
-  return 0
-}
-
-selectTables() {
-
-  local mode=""
-  local current=""
-  local modes=()
-
-  # Keep the currently selected backend when it is fully functional.
-  if testTables; then
-    return 0
-  fi
-
-  current=$(iptables --version 2>/dev/null || true)
-
-  if [[ "$current" == *"nf_tables"* ]]; then
-    modes=( "legacy" )
-  elif [[ "$current" == *"legacy"* ]]; then
-    modes=( "nft" )
-  elif [[ "${ENGINE,,}" == "docker" ]]; then
-    modes=( "legacy" "nft" )
-  else
-    modes=( "nft" "legacy" )
-  fi
-
-  for mode in "${modes[@]}"; do
-
-    command -v "iptables-$mode" > /dev/null 2>&1 || continue
-    setTables "$mode" && testTables && return 0
-
-  done
-
-  return 1
-}
-
-clearTables() {
-
-  local table=""
-  local line=""
-  local rules=""
-  local failed="N"
-  local rule_tag="remove"
-  local re="--comment[[:space:]]+\"?$rule_tag\"?([[:space:]]|\$)"
-
-  selectTables || return 1
-
-  # Store the current iptables ruleset.
-  ! rules=$(iptables-save 2>/dev/null) && return 1
-
-  if [ -n "$rules" ]; then
-
-    # Delete every rule tagged with our unique identifier,
-    # leaving all other rules intact.
-    while IFS= read -r line; do
-
-      case "$line" in
-        \*nat ) table="nat" ;;
-        \*filter ) table="filter" ;;
-        \*mangle ) table="mangle" ;;
-        \*raw ) table="raw" ;;
-      esac
-
-      if [[ "$line" == -A* ]] && [[ "$line" =~ $re ]]; then
-        line="${line/-A /-D }"
-
-        # Parse the quoting produced by iptables-save before deleting the rule.
-        if ! printf '%s\n' "$line" |
-          xargs -r iptables -t "$table" > /dev/null 2>&1; then
-          failed="Y"
-        fi
-      fi
-
-    done <<< "$rules"
-
-  fi
-
-  enabled "$failed" && return 1
   return 0
 }
 
@@ -883,11 +1057,20 @@ formatAddress() {
 
 showHostInfo() {
 
-  local mtu=""
-  local host=""
-  local uplink=""
+  local mtu="" host="" uplink="" prefix=""
 
-  uplink=$(formatAddress "$UPLINK" "$PREFIX" || true)
+  prefix=$(ip -4 -o address show dev "$DEV" scope global 2>/dev/null |
+    awk -v ip="$UPLINK" '
+      {
+        split($4, address, "/")
+        if (address[1] == ip) {
+          print address[2]
+          exit
+        }
+      }
+    ')
+
+  uplink=$(formatAddress "$UPLINK" "$prefix" || true)
   [ -z "$uplink" ] && uplink="(none)"
 
   local line="❯ Host: $uplink"
@@ -896,7 +1079,7 @@ showHostInfo() {
   [ -n "$host" ] && line+=" ($host)"
 
   local obvious=""
-  if [[ "$uplink" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)\.[0-9]+$ ]]; then
+  if [[ "$UPLINK" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)\.[0-9]+$ ]]; then
     obvious="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}.1"
   fi
 
@@ -925,10 +1108,9 @@ showHostInfo() {
   [ ! -f "$file" ] && file="/etc/resolv.conf"
 
   if [ -f "$file" ]; then
-    nameservers=$(grep '^nameserver ' "$file" |
-      sed 's/^nameserver //' |
+    nameservers=$(awk '$1 == "nameserver" { print $2 }' "$file" |
       paste -sd ',' |
-      sed 's/,/, /g')
+      sed 's/,/, /g' || true)
   fi
 
   [ -z "$nameservers" ] && nameservers="(none)"
@@ -977,7 +1159,7 @@ showBridgeInfo() {
   return 0
 }
 
-prepareNetwork() {
+initializeNetwork() {
 
   detectInterface
   validateInterface
@@ -994,6 +1176,7 @@ prepareNetwork() {
   configureMAC
 
   showHostInfo
+  closeInterfaces
 
   return 0
 }
@@ -1018,9 +1201,6 @@ blockLicense() {
 
 blockLicense
 
-detectEngine
-detectRootless
-
 disabled "$NETWORK" && return 0
 
 if ! isNAT; then
@@ -1031,8 +1211,7 @@ fi
 msg="Initializing network..."
 enabled "$DEBUG" && info "$msg"
 
-prepareNetwork
-closeInterfaces
+initializeNetwork
 
 # Configure NAT networking
 if ! configureNAT; then
